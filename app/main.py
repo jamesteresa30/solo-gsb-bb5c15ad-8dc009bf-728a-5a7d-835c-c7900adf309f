@@ -19,6 +19,9 @@ from .schemas import (
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
+    SerialTimelineConflictResponse,
+    SerialTimelineCreate,
+    SerialTimelineOut,
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
@@ -28,6 +31,11 @@ from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
+from .timeline import (
+    LatestObservationConflictError,
+    TimelineConflictError,
+    build_serial_timeline,
+)
 from .transfer import TransferSimulationError, run_transfer_simulation
 
 
@@ -289,6 +297,43 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "其后各轮所有节点仅依据上一轮快照同时更新"
         )
         return result
+
+    @app.post(
+        "/api/zones/{zone}/serial-timelines",
+        response_model=SerialTimelineOut,
+        responses={
+            409: {
+                "model": SerialTimelineConflictResponse,
+                "description": (
+                    "无法构造仅含相等/有效前进关系的时间线"
+                    "（no_valid_timeline，detail 给出冲突时间桶位置、候选与上一桶可延续值）"
+                ),
+            }
+        },
+    )
+    def create_serial_timeline(zone: str, payload: SerialTimelineCreate) -> dict:
+        """从多源观测重建 serial 时间线（仅演算，不写库）。
+
+        观测按 ``bucket_seconds`` 等宽分桶；同一采集源在桶内只保留
+        ``observed_at`` 最新的观测，若其最新时刻同时上报了不同 serial
+        则返回 422。随后用动态规划从各桶候选值中选出一条相邻关系仅含
+        RFC 1982 相等/有效前进的时间线，目标依次为最大化采集源支持数、
+        最少跳变、整条序列字典序最小；某桶所有候选均无法从上一桶延续
+        （全为倒退或不可比较）时返回 409 并给出冲突时间桶位置。
+        """
+        zone_name = _normalize_zone(zone)
+        observations = [
+            (obs.collector, obs.observed_at, obs.serial)
+            for obs in payload.observations
+        ]
+        try:
+            return build_serial_timeline(
+                zone_name, observations, payload.bucket_seconds
+            )
+        except LatestObservationConflictError as exc:
+            raise HTTPException(status_code=422, detail=exc.detail) from exc
+        except TimelineConflictError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     return app
 

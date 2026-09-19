@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -423,3 +423,120 @@ class TransferSimulationConflictResponse(BaseModel):
     """达到同步轮次上限时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: TransferSimulationConflictDetail
+
+
+# ---------- 多源观测 serial 时间线重建 ----------
+
+
+class TimelineObservation(BaseModel):
+    """单个采集源的一次 serial 观测。"""
+
+    collector: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["collector-a"],
+        description="采集源名称（去首尾空白后不能为空）",
+    )
+    observed_at: datetime = Field(
+        examples=["2026-09-19T08:30:00Z"],
+        description="观测时刻（ISO 8601，须携带时区）",
+    )
+    serial: Serial = Field(description="观测到的 SOA serial（32 位无符号）")
+
+    @field_validator("collector")
+    @classmethod
+    def _check_collector(cls, value: str) -> str:
+        collector = value.strip()
+        if not collector:
+            raise ValueError("采集源名称不能为空")
+        return collector
+
+    @field_validator("observed_at")
+    @classmethod
+    def _check_observed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("observed_at 必须携带时区信息")
+        return value
+
+
+class SerialTimelineCreate(BaseModel):
+    """多源观测时间线重建请求（仅演算，不写库）。"""
+
+    observations: list[TimelineObservation] = Field(
+        min_length=1,
+        max_length=4096,
+        description="多采集源的 serial 观测列表（按时间桶聚合，与提交顺序无关）",
+    )
+    bucket_seconds: int = Field(
+        ge=1,
+        le=31536000,
+        description="时间桶宽度（秒）：observed_at 向下取整到桶宽倍数后相同的观测归入同一桶",
+    )
+
+
+class TimelineCandidate(BaseModel):
+    """时间桶内的一个候选 serial 及其支持/异议采集源。"""
+
+    serial: int = Field(description="候选 serial 值")
+    supporters: list[str] = Field(description="桶内最新观测为该值的采集源（按名字典序）")
+    dissenters: list[str] = Field(description="桶内最新观测为其他值的采集源（按名字典序）")
+    selected: bool = Field(description="该候选是否被选入最终时间线")
+
+
+class TimelineBucket(BaseModel):
+    """一个时间桶的选值结果。"""
+
+    index: int = Field(ge=0, description="时间桶序号（按时间升序从 0 开始，仅计含观测的桶）")
+    bucket_start: str = Field(description="时间桶起始时刻（UTC，ISO 8601）")
+    serial: int = Field(description="动态规划为该桶选定的 serial")
+    relation: Literal["initial", "advance", "equal"] = Field(
+        description="选值相对上一时间桶选值的 RFC 1982 关系；首桶为 initial"
+    )
+    supporters: list[str] = Field(description="选值的支持采集源（按名字典序）")
+    dissenters: list[str] = Field(description="选值的异议采集源（按名字典序）")
+    candidates: list[TimelineCandidate] = Field(
+        description="桶内全部候选及其支持/异议采集源（按 serial 升序）"
+    )
+
+
+class SerialTimelineOut(BaseModel):
+    zone: str
+    bucket_seconds: int = Field(description="时间桶宽度（秒）")
+    bucket_count: int = Field(description="含观测的时间桶数量")
+    total_support: int = Field(description="各桶选值的采集源支持数之和（首要优化目标）")
+    jumps: int = Field(description="相邻桶选值发生跳变（advance）的次数（次要优化目标）")
+    buckets: list[TimelineBucket]
+    note: str
+
+
+class TimelineConflictCandidate(BaseModel):
+    """冲突时间桶内的一个候选 serial 及其支持/异议采集源。"""
+
+    serial: int
+    supporters: list[str]
+    dissenters: list[str]
+
+
+class SerialTimelineConflictDetail(BaseModel):
+    """无法构造合法时间线时 409 响应的 detail 结构。"""
+
+    reason: Literal["no_valid_timeline"]
+    message: str
+    bucket_index: int = Field(
+        description="无法延续的时间桶序号（与 200 响应 buckets[].index 含义一致）"
+    )
+    bucket_start: str = Field(description="冲突时间桶起始时刻（UTC，ISO 8601）")
+    candidates: list[TimelineConflictCandidate] = Field(
+        description="冲突时间桶的全部候选及其支持/异议采集源（按 serial 升序）"
+    )
+    previous_bucket_index: int = Field(description="上一时间桶序号")
+    previous_bucket_start: str = Field(description="上一时间桶起始时刻（UTC，ISO 8601）")
+    previous_serials: list[int] = Field(
+        description="上一时间桶中可延续候选的 serial（升序去重）"
+    )
+
+
+class SerialTimelineConflictResponse(BaseModel):
+    """无法构造合法时间线时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: SerialTimelineConflictDetail
