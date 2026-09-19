@@ -10,6 +10,7 @@
 - 提供 **SOA 序列号持久化预留**：在 SQLite 写事务内按区域原子分配下一个 YYYYMMDDnn serial，并发请求不会获得重复值；以 `request_id` 为幂等键，重试安全返回首次结果；预留记录持久化，可按区域查询；
 - 提供 **多权威节点共同发布规划**（`POST /api/zones/{zone}/release-plans`，仅规划不写库）：提交各权威节点的名称与当前 serial，在当日 `YYYYMMDD00`～`99` 候选区间内从小到大找出首个相对**每个节点**都是 RFC 1982 有效前进的候选值；当日区间不存在共同候选时返回 **409**，并给出各节点的 `equal`/`regression`/`incomparable` 阻断摘要；
 - 提供 **区域传送收敛预演**（`POST /api/zones/{zone}/transfer-simulations`，仅预演不写库）：给定各节点当前 serial、有向传送边、源节点与发布 serial，模拟第 0 轮源节点发布后的逐轮同步传播（每节点只从上一轮上游中选择相对自身为 RFC 1982 有效前进且前向距离最小的值，距离并列按上游名排序，所有节点同时更新），返回逐轮变更、最终快照与未收敛节点；达到 `max_rounds` 后仍有节点可更新时返回 **409** 并携带当前快照。
+- 提供 **多源观测 serial 时间线重建**（`POST /api/zones/{zone}/serial-timelines`，仅计算不写库）：接收多个采集源（collector）在不同时刻上报的 SOA serial，按 `bucket_seconds` 做时间桶聚合，桶内同一采集源只取 `observed_at` 最新观测（最新时刻出现不同 serial 返回 **422**）；再用动态规划从各桶候选值中选出一条相邻桶只含 RFC 1982 相等或有效前进关系的时间线，目标依次为最大化采集源支持数、最少跳变、完全并列按整条 serial 序列字典序升序；倒退与不可比较一律禁止，首个无法延续的桶返回 **409** 并给出冲突位置与最优前缀。
 
 ## 快速启动（单条命令）
 
@@ -45,6 +46,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/zones/{zone}/serial-reservations` | 按区域查询预留记录（预留先后升序，支持 `limit`/`offset`） |
 | `POST` | `/api/zones/{zone}/release-plans` | 多权威节点共同发布规划，不写库（200；当日无共同候选返回 409） |
 | `POST` | `/api/zones/{zone}/transfer-simulations` | 区域传送收敛预演，不写库（200；达到轮次上限仍可更新返回 409） |
+| `POST` | `/api/zones/{zone}/serial-timelines` | 多源观测 serial 时间线重建，不写库（200；桶内最新观测冲突 422；无法延续 409） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -351,6 +353,106 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/transfer-simulations
 - 若最后一个被允许的同步轮恰好完成传播（再探测一轮已无节点可更新），仍按正常收敛返回 **200**；
 - 节点/边引用未声明节点、源节点不存在、节点名重复或空白、`serial`/`publish_serial` 越界、发布值相对源节点非前进、`max_rounds` 越界等请求问题返回 **422**；路径中区域名非法返回 **400**。
 
+### 多源观测 serial 时间线重建
+
+`POST /api/zones/{zone}/serial-timelines` 用于汇总多个采集源（如各地 DNS 探测点）在不同时刻观测到的区域 SOA serial，重建一条单调有效的 serial 时间线。结果**即时计算、不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `observations` | 观测列表（至少 1 条、至多 4096 条）；每项含 `collector`（采集源名，去除首尾空白）、`observed_at`（ISO 8601 时间，不带时区偏移时按 UTC 处理）与 `serial`（`0..4294967295`） |
+| `bucket_seconds` | 时间桶大小（正整数秒）；观测按 `floor(observed_at / bucket_seconds)` 分桶，没有观测的空桶不出现在结果中 |
+
+处理规则：
+
+1. **桶内源内归并**：同一采集源在同一桶内仅保留 `observed_at` 最新的一条观测（更早的观测整体作废）；若其最新时刻同时上报了**不同 serial**（采集源自身数据矛盾），返回 **422**，`detail.conflicts` 列出冲突桶、采集源与冲突 serial；完全重复的观测（同源同时刻同 serial）按一条处理；
+2. **桶候选值**：桶内每个不同 serial 构成一个候选，最新观测等于该值的采集源为 `supporters`，其余采集源为 `dissenters`；
+3. **动态规划选线**：相邻时间桶选值之间只允许 RFC 1982 **相等（equal）或有效前进（advance）**，倒退（regression）与相距恰好 `2^31` 的不可比较（incomparable）路径一律禁止。优化目标依次为：
+   - **最大化总支持数**：各桶 `supporters` 数量之和；
+   - **最少跳变**：相邻桶选值不同（advance）的次数最少（相等不产生跳变）；
+   - **字典序**：以上完全并列时，按整条 serial 序列（普通整数序）字典序升序。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/serial-timelines \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "bucket_seconds": 300,
+        "observations": [
+          {"collector": "probe-hkg", "observed_at": "2026-09-19T08:00:10Z", "serial": 2026091900},
+          {"collector": "probe-fra", "observed_at": "2026-09-19T08:01:00Z", "serial": 2026091900},
+          {"collector": "probe-sin", "observed_at": "2026-09-19T08:02:00Z", "serial": 2026091890},
+          {"collector": "probe-hkg", "observed_at": "2026-09-19T08:06:00Z", "serial": 2026091901},
+          {"collector": "probe-fra", "observed_at": "2026-09-19T08:07:00Z", "serial": 2026091901},
+          {"collector": "probe-sin", "observed_at": "2026-09-19T08:08:00Z", "serial": 2026091900}
+        ]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "bucket_seconds": 300,
+  "buckets": [
+    {
+      "index": 0,
+      "bucket_start": "2026-09-19T08:00:00Z",
+      "bucket_end": "2026-09-19T08:05:00Z",
+      "serial": 2026091900,
+      "supporters": ["probe-fra", "probe-hkg"],
+      "dissenters": ["probe-sin"],
+      "candidates": [
+        {"serial": 2026091890, "supporters": ["probe-sin"], "dissenters": ["probe-fra", "probe-hkg"]},
+        {"serial": 2026091900, "supporters": ["probe-fra", "probe-hkg"], "dissenters": ["probe-sin"]}
+      ]
+    },
+    {
+      "index": 1,
+      "bucket_start": "2026-09-19T08:05:00Z",
+      "bucket_end": "2026-09-19T08:10:00Z",
+      "serial": 2026091901,
+      "supporters": ["probe-fra", "probe-hkg"],
+      "dissenters": ["probe-sin"],
+      "candidates": [
+        {"serial": 2026091900, "supporters": ["probe-sin"], "dissenters": ["probe-fra", "probe-hkg"]},
+        {"serial": 2026091901, "supporters": ["probe-fra", "probe-hkg"], "dissenters": ["probe-sin"]}
+      ]
+    }
+  ],
+  "timeline": [2026091900, 2026091901],
+  "total_support": 4,
+  "changes": 1,
+  "note": "时间线仅依据请求中的多源观测即时重建，不写入数据库；相邻时间桶选值只允许 RFC 1982 相等或有效前进，目标依次为最大化采集源支持数、最少跳变、serial 序列字典序升序"
+}
+```
+
+- `buckets[]` 按时间升序列出所有**非空**桶（空桶自动跳过，`index` 为非空桶序号），每桶给出选中的 `serial`、`supporters`（按名字典序）、`dissenters`，以及桶内全部 `candidates`（serial 升序）以便核对；
+- `timeline` 为各桶选值，`total_support` 为各桶支持采集源数之和，`changes` 为相邻桶选值不同的跳变次数；
+- **时间线无法延续（409）**：某桶的全部候选相对上一桶所有可达选值都是倒退或不可比较时，返回 **409**，`detail.reason` 为 `unextendable_timeline`，并给出 `conflict_bucket`（首个断点）、各候选的 `supporters`/`dissenters` 及相对上一桶可达值的 `predecessor_relations`（全部为 `regression`/`incomparable`），以及按相同目标选出的最优前缀 `prefix_buckets` / `prefix_timeline` / `prefix_total_support` / `prefix_changes`：
+
+```json
+{
+  "detail": {
+    "reason": "unextendable_timeline",
+    "message": "第 1 个时间桶（2026-09-19T08:05:00Z–2026-09-19T08:10:00Z）中不存在相对上一桶可达选值为 RFC 1982 相等或有效前进的候选 serial，时间线无法继续延续",
+    "zone": "example.com",
+    "bucket_seconds": 300,
+    "conflict_bucket": {"index": 1, "bucket_start": "2026-09-19T08:05:00Z", "bucket_end": "2026-09-19T08:10:00Z"},
+    "candidates": [
+      {"serial": 50, "supporters": ["a"], "dissenters": [],
+       "predecessor_relations": [{"serial": 100, "relation": "regression"}]}
+    ],
+    "prefix_buckets": [ {"index": 0, "serial": 100, "supporters": ["a"], "dissenters": [], "...": "..."} ],
+    "prefix_timeline": [100],
+    "prefix_total_support": 1,
+    "prefix_changes": 0
+  }
+}
+```
+
+- **桶内最新观测冲突（422）**：同一采集源在桶内的最新时刻同时出现不同 serial 时返回 **422**，`detail.reason` 为 `conflicting_latest_observation`，`detail.conflicts` 给出每个冲突的桶位置、采集源与 serial 集合（按桶序号与采集源名排序）；
+- `4294967295 → 0` 这类回绕观测属于有效前进，可正常跨桶延续；`bucket_seconds` 必须为正整数，观测列表不能为空，`serial` 越界、时间格式非法、采集源名为空白等请求问题返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -387,6 +489,7 @@ app/
   repair.py    # 序列修复预演（不落库）
   release_plan.py  # 多权威节点共同发布规划（不落库）
   transfer.py  # 区域传送收敛预演（不落库）
+  timeline.py  # 多源观测 serial 时间线重建（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

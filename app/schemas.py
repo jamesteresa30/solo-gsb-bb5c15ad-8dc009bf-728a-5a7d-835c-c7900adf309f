@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .rfc1982 import MAX_SERIAL, classify
 
@@ -423,3 +429,138 @@ class TransferSimulationConflictResponse(BaseModel):
     """达到同步轮次上限时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: TransferSimulationConflictDetail
+
+
+# ---------- 多源观测 serial 时间线重建 ----------
+
+
+class SerialTimelineObservation(BaseModel):
+    """单个采集源在某一时刻对区域 SOA serial 的一次观测。"""
+
+    collector: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["probe-hkg-1"],
+        description="采集源名（去除首尾空白）；同一源在同一时间桶内仅取最新观测",
+    )
+    observed_at: datetime = Field(
+        description="观测时间（ISO 8601；不带时区偏移的时间戳按 UTC 处理）",
+        examples=["2026-09-19T08:00:00Z"],
+    )
+    serial: Serial = Field(description="该次观测到的 SOA serial（32 位无符号）")
+
+    @field_validator("collector")
+    @classmethod
+    def _check_collector(cls, value: str) -> str:
+        collector = value.strip()
+        if not collector:
+            raise ValueError("采集源名不能为空")
+        return collector
+
+
+class SerialTimelineCreate(BaseModel):
+    """多源 serial 观测时间线重建请求（仅计算，不写库）。"""
+
+    observations: list[SerialTimelineObservation] = Field(
+        min_length=1,
+        max_length=4096,
+        description="多采集源观测列表（至少 1 条，至多 4096 条）",
+    )
+    bucket_seconds: int = Field(
+        ge=1,
+        description=(
+            "时间桶大小（秒，正整数）；观测时间按 floor(observed_at / bucket_seconds) 分桶"
+        ),
+        examples=[300],
+    )
+
+
+class TimelineCandidate(BaseModel):
+    """单个时间桶内的候选 serial 及其支持/异议采集源。"""
+
+    serial: int = Field(description="桶内某采集源最新观测产生的候选 serial")
+    supporters: list[str] = Field(
+        description="桶内最新观测等于该 serial 的采集源（按名字典序排列）"
+    )
+    dissenters: list[str] = Field(
+        description="桶内最新观测为其他 serial 的采集源（按名字典序排列）"
+    )
+
+
+class SerialTimelineBucket(TimelineCandidate):
+    """时间线中一个非空时间桶的选值结果。"""
+
+    index: int = Field(ge=0, description="非空时间桶序号（按时间从早到晚，从 0 起；不含空桶）")
+    bucket_start: str = Field(description="桶起始时间（UTC ISO 8601，含时区 Z）")
+    bucket_end: str = Field(description="桶结束时间（UTC ISO 8601，左闭右开）")
+    candidates: list[TimelineCandidate] = Field(
+        description="该桶全部候选 serial 及其支持/异议采集源（serial 升序）"
+    )
+
+
+class SerialTimelineOut(BaseModel):
+    """正常重建（200）响应体。"""
+
+    zone: str
+    bucket_seconds: int = Field(ge=1)
+    buckets: list[SerialTimelineBucket] = Field(
+        description="非空时间桶列表（按时间升序），每项给出该桶选值、支持/异议采集源"
+    )
+    timeline: list[int] = Field(
+        description="各桶选值 serial 序列，相邻项只可能是 RFC 1982 相等或有效前进"
+    )
+    total_support: int = Field(ge=0, description="各桶支持采集源数之和（首要优化目标）")
+    changes: int = Field(
+        ge=0, description="相邻桶选值不同的跳变次数（次要优化目标，越小越优）"
+    )
+    note: str
+
+
+class TimelinePredecessorRelation(BaseModel):
+    """无法延续时，候选 serial 相对上一桶某个可达选值的关系。"""
+
+    serial: int = Field(description="上一桶可达的选值 serial")
+    relation: Literal["regression", "incomparable"] = Field(
+        description="候选相对该选值的关系（禁止倒退与不可比较）"
+    )
+
+
+class BlockedTimelineCandidate(TimelineCandidate):
+    """冲突桶中无法被选中的候选 serial。"""
+
+    predecessor_relations: list[TimelinePredecessorRelation] = Field(
+        description="该候选相对上一桶每个可达选值的关系（按上一桶 serial 升序，全部为 regression/incomparable）"
+    )
+
+
+class TimelineBucketRef(BaseModel):
+    """冲突时间桶的位置信息。"""
+
+    index: int = Field(ge=0, description="非空时间桶序号（首个无法延续的桶）")
+    bucket_start: str
+    bucket_end: str
+
+
+class SerialTimelineConflictDetail(BaseModel):
+    """时间线无法延续时 409 响应的 detail 结构。"""
+
+    reason: Literal["unextendable_timeline"]
+    message: str
+    zone: str
+    bucket_seconds: int = Field(ge=1)
+    conflict_bucket: TimelineBucketRef = Field(description="首个无法延续的时间桶位置")
+    candidates: list[BlockedTimelineCandidate] = Field(
+        description="冲突桶的全部候选及其相对上一桶可达选值的关系"
+    )
+    prefix_buckets: list[SerialTimelineBucket] = Field(
+        description="冲突前按相同优化目标选出的最优前缀各桶结果（不含冲突桶）"
+    )
+    prefix_timeline: list[int] = Field(description="最优前缀各桶选值 serial 序列")
+    prefix_total_support: int = Field(ge=0, description="最优前缀的总支持采集源数")
+    prefix_changes: int = Field(ge=0, description="最优前缀的跳变次数")
+
+
+class SerialTimelineConflictResponse(BaseModel):
+    """时间线无法延续时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: SerialTimelineConflictDetail

@@ -19,6 +19,9 @@ from .schemas import (
     RepairPlanOut,
     SerialReservationCreate,
     SerialReservationOut,
+    SerialTimelineConflictResponse,
+    SerialTimelineCreate,
+    SerialTimelineOut,
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
@@ -28,6 +31,11 @@ from .repair import build_repair_plan
 from .release_plan import ReleasePlanError, build_release_plan
 from .service import analyze
 from .suggest import SuggestionError, suggest_next_serial
+from .timeline import (
+    LatestObservationConflict,
+    TimelineError,
+    build_serial_timeline,
+)
 from .transfer import TransferSimulationError, run_transfer_simulation
 
 
@@ -289,6 +297,58 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "其后各轮所有节点仅依据上一轮快照同时更新"
         )
         return result
+
+    @app.post(
+        "/api/zones/{zone}/serial-timelines",
+        response_model=SerialTimelineOut,
+        responses={
+            409: {
+                "model": SerialTimelineConflictResponse,
+                "description": (
+                    "某时间桶的全部候选相对上一桶可达选值均为倒退或不可比较，"
+                    "时间线无法延续（unextendable_timeline，detail 给出冲突桶位置、"
+                    "各候选与上一桶可达值的关系及冲突前的最优前缀）"
+                ),
+            },
+            422: {
+                "description": (
+                    "同一采集源在桶内的最新观测时刻同时出现不同 serial"
+                    "（reason=conflicting_latest_observation，detail 列出冲突位置）；"
+                    "其余请求体字段校验失败同样返回 422"
+                ),
+            },
+        },
+    )
+    def create_serial_timeline(zone: str, payload: SerialTimelineCreate) -> dict:
+        """多源观测 serial 时间线重建（不落库）。
+
+        观测按 ``bucket_seconds`` 做时间桶聚合，同一采集源在桶内仅保留
+        ``observed_at`` 最新的观测；其最新时刻出现不同 serial 时返回 422。
+        随后用动态规划从各桶候选值中选择一条相邻桶仅含 RFC 1982 相等或有效
+        前进关系的时间线，目标依次为：最大化采集源支持数（各桶支持数之和）、
+        最少跳变、完全并列按整条 serial 序列字典序升序。倒退与不可比较的
+        选值路径一律禁止；首个无法延续的桶返回 409 并给出冲突位置与前缀。
+        """
+        zone_name = _normalize_zone(zone)
+        observations = [
+            (item.collector, item.observed_at, item.serial)
+            for item in payload.observations
+        ]
+        try:
+            return build_serial_timeline(
+                zone_name, observations, payload.bucket_seconds
+            )
+        except LatestObservationConflict as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": "conflicting_latest_observation",
+                    "message": str(exc),
+                    "conflicts": exc.conflicts,
+                },
+            ) from exc
+        except TimelineError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     return app
 

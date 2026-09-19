@@ -1059,8 +1059,410 @@ def test_transfer_simulation_duplicate_edges_treated_as_one(client):
     ]
 
 
-# ---------- 并发：串行化分配，不重复 serial ----------
+# ---------- 多源观测 serial 时间线重建 ----------
 
+
+def _obs(collector: str, at: str, serial: int) -> dict:
+    return {"collector": collector, "observed_at": at, "serial": serial}
+
+
+def test_serial_timeline_basic_buckets(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("probe-hkg", "2026-09-19T08:00:10Z", 2026091900),
+                _obs("probe-fra", "2026-09-19T08:01:00Z", 2026091900),
+                _obs("probe-sin", "2026-09-19T08:02:00Z", 2026091890),
+                _obs("probe-hkg", "2026-09-19T08:06:00Z", 2026091901),
+                _obs("probe-fra", "2026-09-19T08:07:00Z", 2026091901),
+                _obs("probe-sin", "2026-09-19T08:08:00Z", 2026091900),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["bucket_seconds"] == 300
+    assert body["timeline"] == [2026091900, 2026091901]
+    assert body["total_support"] == 4  # 每桶多数候选各 2 个支持者
+    assert body["changes"] == 1
+    assert len(body["buckets"]) == 2
+
+    b0, b1 = body["buckets"]
+    assert b0["index"] == 0
+    assert b0["bucket_start"] == "2026-09-19T08:00:00Z"
+    assert b0["bucket_end"] == "2026-09-19T08:05:00Z"
+    assert b0["serial"] == 2026091900
+    assert b0["supporters"] == ["probe-fra", "probe-hkg"]
+    assert b0["dissenters"] == ["probe-sin"]
+    # 候选按 serial 升序返回，含支持/异议采集源
+    assert [(c["serial"], c["supporters"], c["dissenters"]) for c in b0["candidates"]] == [
+        (2026091890, ["probe-sin"], ["probe-fra", "probe-hkg"]),
+        (2026091900, ["probe-fra", "probe-hkg"], ["probe-sin"]),
+    ]
+    assert b1["bucket_start"] == "2026-09-19T08:05:00Z"
+    assert b1["serial"] == 2026091901
+    assert b1["supporters"] == ["probe-fra", "probe-hkg"]
+    assert b1["dissenters"] == ["probe-sin"]
+    # 选值序列相邻项仅允许 equal/advance
+    assert all(
+        classify(a, b) in ("advance", "equal") for a, b in zip(body["timeline"], body["timeline"][1:])
+    )
+
+
+def test_serial_timeline_within_bucket_keeps_latest_per_collector(client):
+    # 同一采集源在桶内的更早观测被最新观测覆盖，不产生候选也不成为异议
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:04:59Z", 110),
+                _obs("b", "2026-09-19T08:03:00Z", 110),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    bucket = resp.json()["buckets"][0]
+    assert bucket["candidates"] == [
+        {"serial": 110, "supporters": ["a", "b"], "dissenters": []}
+    ]
+    assert bucket["serial"] == 110
+    assert bucket["supporters"] == ["a", "b"]
+    assert bucket["dissenters"] == []
+
+
+def test_serial_timeline_conflicting_latest_same_timestamp_422(client):
+    # 同一采集源在同一最新时刻出现不同 serial => 422
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:00:00Z", 101),
+                _obs("b", "2026-09-19T08:00:00Z", 100),
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "conflicting_latest_observation"
+    assert detail["conflicts"] == [
+        {
+            "bucket_index": 0,
+            "bucket_start": "2026-09-19T08:00:00Z",
+            "bucket_end": "2026-09-19T08:05:00Z",
+            "collector": "a",
+            "serials": [100, 101],
+        }
+    ]
+
+
+def test_serial_timeline_same_latest_timestamp_same_serial_is_fine(client):
+    # 完全重复的观测（同源同时刻同 serial）视为一条，不冲突
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["timeline"] == [100]
+
+
+def test_serial_timeline_earlier_conflict_superseded_is_fine(client):
+    # 早期时刻的冲突值被同源自更新观测整体覆盖 => 不构成 422
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:00:00Z", 101),
+                _obs("a", "2026-09-19T08:01:00Z", 102),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["timeline"] == [102]
+
+
+def test_serial_timeline_409_regression(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:06:00Z", 50),
+            ],
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "unextendable_timeline"
+    assert detail["zone"] == "example.com"
+    assert detail["bucket_seconds"] == 300
+    assert detail["conflict_bucket"] == {
+        "index": 1,
+        "bucket_start": "2026-09-19T08:05:00Z",
+        "bucket_end": "2026-09-19T08:10:00Z",
+    }
+    blocked = detail["candidates"]
+    assert len(blocked) == 1
+    assert blocked[0]["serial"] == 50
+    assert blocked[0]["supporters"] == ["a"]
+    assert blocked[0]["dissenters"] == []
+    assert blocked[0]["predecessor_relations"] == [
+        {"serial": 100, "relation": "regression"}
+    ]
+    # 冲突前最优前缀
+    assert detail["prefix_timeline"] == [100]
+    assert detail["prefix_total_support"] == 1
+    assert detail["prefix_changes"] == 0
+    assert [b["serial"] for b in detail["prefix_buckets"]] == [100]
+
+
+def test_serial_timeline_409_incomparable(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 0),
+                _obs("a", "2026-09-19T08:01:00Z", SERIAL_HALF),
+            ],
+        },
+    )
+    assert resp.status_code == 409
+    relation = resp.json()["detail"]["candidates"][0]["predecessor_relations"][0]
+    assert relation == {"serial": 0, "relation": "incomparable"}
+
+
+def test_serial_timeline_dp_maximizes_total_support(client):
+    # 桶0：A=100(支持者 a)、B=101(支持者 b,c)；桶1：仅 B 之后可延续且由 a,b,c 全支持
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("b", "2026-09-19T08:00:00Z", 101),
+                _obs("c", "2026-09-19T08:00:00Z", 101),
+                _obs("a", "2026-09-19T08:06:00Z", 102),
+                _obs("b", "2026-09-19T08:06:00Z", 102),
+                _obs("c", "2026-09-19T08:06:00Z", 102),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 虽然 100 字典序更小，但从 101 起总支持数 2+3=5 > 1+3=4
+    assert body["timeline"] == [101, 102]
+    assert body["total_support"] == 5
+
+
+def test_serial_timeline_dp_fewest_changes_tiebreak(client):
+    # 两条路径总支持数相同；相等（0 跳变）路径应胜出
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("b", "2026-09-19T08:00:00Z", 100),
+                _obs("a", "2026-09-19T08:06:00Z", 100),  # 相等，1 支持
+                _obs("b", "2026-09-19T08:06:00Z", 101),  # 前进，1 支持
+                _obs("a", "2026-09-19T08:12:00Z", 200),
+                _obs("b", "2026-09-19T08:12:00Z", 200),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["timeline"] == [100, 100, 200]
+    assert body["total_support"] == 5  # 2 + 1 + 2
+    assert body["changes"] == 1        # 仅 100 -> 200 一跳
+
+
+def test_serial_timeline_dp_lexicographic_tiebreak(client):
+    # 各候选支持数与跳变数完全相同：按整条 serial 序列字典序升序
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 100),
+                _obs("b", "2026-09-19T08:00:00Z", 101),
+                _obs("a", "2026-09-19T08:06:00Z", 103),
+                _obs("b", "2026-09-19T08:06:00Z", 102),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # 可行序列 (100,102)/(100,103)/(101,102)/(101,103) 支持均为 2、跳变均为 1
+    assert body["timeline"] == [100, 102]
+    assert body["total_support"] == 2
+    assert body["changes"] == 1
+
+
+def test_serial_timeline_wraparound_advance(client):
+    # 4294967295 -> 0 为回绕有效前进，允许跨桶
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", MAX_SERIAL),
+                _obs("a", "2026-09-19T08:01:00Z", 0),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["timeline"] == [MAX_SERIAL, 0]
+    assert body["changes"] == 1
+
+
+def test_serial_timeline_empty_buckets_skipped_and_indexed(client):
+    # 观测之间跨过空桶；序号只对非空桶计数
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 1),
+                _obs("a", "2026-09-19T08:20:00Z", 2),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    buckets = resp.json()["buckets"]
+    assert [b["index"] for b in buckets] == [0, 1]
+    assert [b["bucket_start"] for b in buckets] == [
+        "2026-09-19T08:00:00Z",
+        "2026-09-19T08:20:00Z",
+    ]
+
+
+def test_serial_timeline_bucket_boundary_split(client):
+    # 08:04:59 与 08:05:00 落入两个 300 秒桶
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 300,
+            "observations": [
+                _obs("a", "2026-09-19T08:04:59Z", 1),
+                _obs("a", "2026-09-19T08:05:00Z", 2),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["buckets"]) == 2
+
+
+def test_serial_timeline_naive_datetime_treated_as_utc(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [_obs("a", "2026-09-19T08:00:00", 7)],
+        },
+    )
+    assert resp.status_code == 200
+    bucket = resp.json()["buckets"][0]
+    assert bucket["bucket_start"] == "2026-09-19T08:00:00Z"
+
+
+def test_serial_timeline_single_bucket(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [
+                _obs("a", "2026-09-19T08:00:00Z", 1),
+                _obs("b", "2026-09-19T08:00:00Z", 1),
+                _obs("c", "2026-09-19T08:00:00Z", 2),
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["timeline"] == [1]
+    assert body["changes"] == 0
+    assert body["total_support"] == 2
+    assert body["buckets"][0]["dissenters"] == ["c"]
+
+
+def test_serial_timeline_not_persisted(client):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [_obs("a", "2026-09-19T08:00:00Z", 1)],
+        },
+    )
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_serial_timeline_invalid_zone_400(client):
+    resp = client.post(
+        "/api/zones/bad_zone!/serial-timelines",
+        json={
+            "bucket_seconds": 60,
+            "observations": [_obs("a", "2026-09-19T08:00:00Z", 1)],
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"bucket_seconds": 60, "observations": []},                  # 空观测列表
+        {"bucket_seconds": 0, "observations": [                      # bucket_seconds 下界
+            _obs("a", "2026-09-19T08:00:00Z", 1)]},
+        {"bucket_seconds": -5, "observations": [                     # bucket_seconds 负数
+            _obs("a", "2026-09-19T08:00:00Z", 1)]},
+        {"observations": [                                           # 缺 bucket_seconds
+            _obs("a", "2026-09-19T08:00:00Z", 1)]},
+        {"bucket_seconds": 60, "observations": [                    # 缺 collector
+            {"observed_at": "2026-09-19T08:00:00Z", "serial": 1}]},
+        {"bucket_seconds": 60, "observations": [                    # 空白 collector
+            _obs("   ", "2026-09-19T08:00:00Z", 1)]},
+        {"bucket_seconds": 60, "observations": [                    # 缺 observed_at
+            {"collector": "a", "serial": 1}]},
+        {"bucket_seconds": 60, "observations": [                    # 时间格式非法
+            _obs("a", "not-a-time", 1)]},
+        {"bucket_seconds": 60, "observations": [                    # serial 下越界
+            _obs("a", "2026-09-19T08:00:00Z", -1)]},
+        {"bucket_seconds": 60, "observations": [                    # serial 上越界
+            _obs("a", "2026-09-19T08:00:00Z", MAX_SERIAL + 1)]},
+        {"bucket_seconds": 60},                                     # 缺 observations
+        {"bucket_seconds": 60, "observations": [                    # 观测非对象
+            "not-an-object"]},
+        "not-an-object",                                            # 请求体非对象
+    ],
+)
+def test_serial_timeline_invalid_body_422(client, payload):
+    resp = client.post(
+        "/api/zones/example.com/serial-timelines", json=payload
+    )
+    assert resp.status_code == 422
+
+
+# ---------- 并发：串行化分配，不重复 serial ----------
 
 def test_concurrent_reservations_no_duplicate_serials(tmp_path):
     db_path = str(tmp_path / "concurrent.db")
